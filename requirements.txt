@@ -1,0 +1,2 @@
+# ROS 2 packages come from the sourced lecture environment.
+mcp==1.26.0
