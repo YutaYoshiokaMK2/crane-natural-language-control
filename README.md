@@ -1,164 +1,229 @@
-# 自然言語で操作するCRANE+ V2
+# CRANE+ V2の自然言語制御
 
-「半分の時間」を繰り返す場合、直前の動作時間をさらに半分にします。グリッパーが2秒→1秒になった後、再度半分の0.5秒は下限1秒を下回るため実行できません。時間を自動変更せず、理由を表示して停止します。
-時間を維持する指示例: `Return to your original posture, then repeat the previous action at the same speed.`
-姿勢復帰の手順は次回の再実行対象に含めません。既存ログの `--resume` にも適用します。
+フィジカルAI講座の最終課題として、自然言語の指示からGazebo内のCRANE+ V2を操作するシステムを実装した。
 
-フィジカルAI講座の最終課題。LLMが自然言語の指示と現在の関節状態から操作手順を考え、MCP・ROS 2を通じてGazebo内のCRANE+ V2を動かすことを目指します。
+LLMは現在の関節状態を参照し、目標角度、動作時間、操作順序を計画する。実行側では指示の範囲と数値制限を検査し、MCP・ROS 2を介して関節を制御する。固定のジェスチャーを選択する方式ではなく、関節単位の計画生成を対象とする。
 
-## 現在の状態
+## システム構成
 
-2026-10-25に講義用 `pai_ros2` を復旧。Gazebo起動、状態取得、専用MCP経由の全4関節・グリッパの往復とタイムアウトを検証しました。無料ローカルLLMからの英語指示で、肩・肘の同時移動と復帰まで実行しました。追加指示への追従には失敗例があります。
-
-## 想定する機能
-
-- 現在の関節状態の取得
-- 関節の目標角度と動作時間を指定した移動
-- グリッパの開閉
-- 複数操作の組み合わせと、追加指示による変更
-- 指令の検査、到達確認、実行結果の記録
-
-追加学習は行いません。ローカルOllama＋Qwen3 4B（思考なし）を使い、指示の解釈・解釈の照合・角度計画を分離します。Pythonが許可範囲と数値を検査し、MCPツールを順次呼びます。完成済みジェスチャーのライブラリは使いません。目標角度・未指定の時間は引き続きLLMが現在の関節状態から考えます。
-
-## 指示外の動きを防ぐ仕組み
-
-絶対角度を指定する場合（例: `Set the base, shoulder, elbow, and wrist joints to 0 radians over 4 seconds. Keep the gripper unchanged.`）は、契約に `set_absolute` と各関節の `absolute_targets` を保持します。計画は絶対目標を直接出力し、LLMに符号付きoffsetへの変換をさせません。指定値と異なる目標は実行前に拒否します。すでに目標角度の関節は、そのまま保持できます。相対移動の指示と絶対角度の指定を区別します。
-
-この英文でのGazebo自動実行を確認済みです。4関節の目標0 radへの到達成功後、静止状態の最大絶対角度は約1.18e-12 rad、グリッパーは約0.1 radのままでした。修正前には負の現在角度をoffsetへ変換する符号誤りがありました。実行中のクライアントは `exit` 後に再起動して修正を読み込んでください。
-
-1. 指示から、動かしてよい関節・手順・明示された時間・復帰の有無を抽出します。各手順には指示文の引用を付け、関節名の対応づけをコードで行います。指示文に根拠のない関節や復帰は拒否します。
-2. 別のLLM呼び出しで、元の指示と抽出結果を照合します。曖昧・未対応・不一致の場合は角度計画へ進まず停止します。
-3. 抽出結果を固定して、関節・ステップ数・順序・基準姿勢・指定時間をJSON Schemaと実行前検証で制約します。再生成しても許可範囲を広げません。要求された移動を実質ゼロ移動で代用する計画も拒否します。
-4. 実行直前に状態を再取得します。計画開始時から0.01 radを超えて姿勢が変わっていれば、計画を自動補正せず停止します。
-
-肘だけの例外処理は削除し、全関節に同じ規則を適用しています。引用した指示文から関節名と操作の候補を絞る処理は、角度列を持つジェスチャーではありません。
-
-**自由な自然言語の意味を完全に保証するものではありません。** 解釈と照合が同じ誤解をする可能性は残ります。既定では自動実行を維持し、不明・不一致・制約違反の場合に指令を送らず停止します。対象関節、動かさない関節、角度の変化、時間を表示します。モデルの英文説明は検証結果ではありません。
-
-```powershell
-uv run --with mcp==1.26.0 python local_client.py --docker --execute --resume
+```text
+自然言語の指示
+  ↓
+Ollama / Qwen3 4B
+  指示の分類 → 操作範囲の抽出 → 原文との照合 → 角度・時間の計画
+  ↓
+Pythonクライアント
+  計画の検査・絶対目標への変換
+  ↓ MCP（stdio）
+専用MCPサーバー
+  ↓ ROS 2 Humble
+Gazebo / CRANE+ V2
+  関節移動・到達確認
 ```
 
-最新の方式では、現在姿勢から手首だけを動かす自動実行をGazeboで確認しました。手首0.150→目標0.200 rad（3秒）が到達成功、他4関節の変動は最大約1e-10 radで、姿勢復帰の指令はありませんでした。全指示の成功を保証するものではありません。Qwen2.5 3Bは新しい指示解釈で関節取り違えが多かったため、既存のQwen3 4Bへ既定値を変更しています。
+推論にはローカルのQwen3 4Bを思考なしで使用する。追加学習やクラウドAPIは使用しない。ROS 2とGazeboは講義用Dockerコンテナを利用し、本リポジトリのコードと追加依存はコンテナ内の専用ディレクトリへ配置する。
 
-必要な場合だけ `--confirm-plan` を追加すると表示後の `y` 入力を必要にできますが、既定の自動実行には確認操作を追加していません。明示的な全姿勢復帰のみ、Pythonがアームとグリッパーに分けて実行します。合計時間を指定した全姿勢復帰は、時間を勝手に倍にせず停止します。
+MCPサーバーが公開する操作は次の3種類である。
 
-## 実行方法（Windows＋既存講義コンテナ）
+| ツール | 処理 |
+| --- | --- |
+| `get_joint_state` | 現在の関節角度とURDFの制限値を取得する |
+| `move_joints` | アームの関節へ絶対角度を指令し、到達を確認する |
+| `set_gripper` | グリッパーへ絶対角度を指令し、到達を確認する |
 
-### 終了と翌日の再開
+## 計画生成と実行前検査
 
-クライアントの `instruction ...>` で `exit` を入力し、PowerShellへ戻ったら `docker stop pai_ros2` でGazebo・ROS・VNCをまとめて停止します。Ollamaのモデルをメモリから解放するには `.\.tmp\ollama\ollama.exe stop qwen3:4b` を実行します。Ollamaサーバー自体も終了する場合は、タスクマネージャーで今回起動した `.tmp/ollama/ollama.exe` を終了してください。Docker Desktopも終了するなら、通知領域のメニューからQuitを選びます。
+LLMの出力をそのままROSへ送信せず、操作範囲と角度計画を分けて扱う。
 
-再開はDocker Desktopを起動し、本リポジトリで `docker start pai_ros2`、上記の `prepare.ps1`、`launch-gazebo.ps1` を実行します。Ollamaが終了している場合だけ `start-local-llm.ps1` を実行します（同じスクリプトを二重起動しない）。ダウンロード済みモデルを再取得する必要はありません。その後 `uv run --with mcp==1.26.0 python local_client.py --docker --execute` で開始できます。コンテナ再起動後のGazeboは新しい初期状態なので、通常は `--resume` を付けず、新しい会話として始めます。ログ・モデルはローカルに残りますが、Gitへは含めません。
+1. 指示から対象関節、手順、指定時間、復帰・再実行の有無を抽出する。
+2. 抽出結果を元の指示と別の推論で照合する。
+3. 照合済みの操作範囲を固定し、その範囲内で角度と未指定の時間を計画する。
+4. 計画全体を検査し、実行直前に関節状態を再取得する。
+5. MCPツールを順番に呼び出し、各操作の到達結果を確認する。
 
-前提: Docker Desktop、既存 `pai_ros2`、`uv`。PowerShellで本リポジトリへ移動します。コンテナの教材・バックアップは編集しません。新コードとMCP依存の配置先は `/tmp/crane-nlc` と `/tmp/crane-final-deps` です。
+操作範囲はJSON SchemaとPython側の検証で制約する。関節や手順の追加・欠落、順序の変更、指定時間の変更を検出した場合は実行しない。解釈・照合に失敗した場合も停止する。角度計画は初回を含めて最大3回試行し、その間も操作範囲は変更しない。
+
+絶対角度の指定は `set_absolute` と `absolute_targets` に保持し、指定値を直接目標とする。例えば「0 radにする」という指示をLLMに相対移動量へ変換させない。相対移動は `offsets` で表し、指示開始時の関節角度を基準に絶対目標へ変換する。
+
+既定の動作は自動実行である。任意の `--confirm-plan` オプションを指定した場合に限り、計画表示後の確認入力を必要とする。
+
+## 実行環境
+
+検証環境はWindows、Docker Desktop（WSL 2）、ROS 2 Humble、Python 3.10の講義用コンテナである。コンテナ名は `pai_ros2`、イメージは `airobotbook/ros2-desktop-ai-robot-book-humble:latest` を使用した。推論はIntel Core Ultra 7 258V、メモリ32 GBのPC上で実行した。GPU加速は未検証である。
+
+実行には次の環境を前提とする。
+
+- Docker Desktopと講義用の `pai_ros2` コンテナ
+- コンテナ内の `/home/ubuntu/airobot_ws` とCRANE+用のGazebo環境
+- Windows側の `uv`
+- OllamaのWindows実行ファイルと `qwen3:4b` モデル
+
+Ollamaは[公式配布](https://github.com/ollama/ollama/releases)の `ollama-windows-amd64.zip` を `.tmp/ollama/` に展開する。`ollama.exe` の配置先は `.tmp/ollama/ollama.exe` である。
+
+## 起動と操作
+
+以下のコマンドは、リポジトリのルートを作業ディレクトリとしてPowerShellで実行する。
+
+### 1. シミュレーターの起動
+
+Docker Desktopの起動後、コンテナへコードと依存パッケージを配置し、Gazeboを起動する。
 
 ```powershell
-# Docker Desktopを起動しておく
 docker start pai_ros2
 powershell -NoProfile -ExecutionPolicy Bypass -File .\prepare.ps1
-# Gazeboがまだ動いていないときに一度だけ実行
 powershell -NoProfile -ExecutionPolicy Bypass -File .\launch-gazebo.ps1
 ```
 
-スクリプトは専用のPowerShellプロセスで実行します。`-ExecutionPolicy Bypass` はそのプロセスだけに適用され、PC全体やユーザーの実行ポリシーは変更しません。
+`prepare.ps1` の配置先は `/tmp/crane-nlc` と `/tmp/crane-final-deps` であり、講義用ワークスペースのソースは変更しない。`ExecutionPolicy Bypass` は起動したPowerShellプロセスにのみ適用する。
 
-画面は http://localhost:6080 の講義デスクトップで確認できます。既存VNCパスワードを使います。起動ログはコンテナ内 `/tmp/crane-final-gazebo.log`。同じROS domainで他の制御・推論ノードを同時に動かさないでください。起動スクリプトは既存のCRANE+ launchを検出すると再起動を省略し、launchなしでGazeboだけが残っている場合はエラーで停止します。
+Gazeboの画面は `http://localhost:6080` の講義デスクトップで確認する。VNCの認証は講義環境の設定に従う。起動ログはコンテナ内の `/tmp/crane-final-gazebo.log` に出力する。
 
-二重起動後に画面を1つ閉じても、ROSノードや別のロボットが残る場合があります。表示と制御がおかしくなった場合は、進行中の操作を終えてから `docker restart pai_ros2` を実行し、上記起動スクリプトで1組だけ起動します。VNCは再接続し、シミュレーションは初期状態になります。
+起動スクリプトは既存のCRANE+ launchを検出した場合、重複起動を省略する。同一ROS domainでの複数クライアントによる同時制御は想定していない。
 
-LLMなしの実機能検証（Gazebo内、全関節を1つずつ0.05 rad動かして戻す）:
+### 2. ローカルLLMの起動
 
-```powershell
-docker exec -u ubuntu pai_ros2 bash -lc 'source /opt/ros/humble/setup.bash; source /home/ubuntu/airobot_ws/install/setup.bash; export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp; export PYTHONPATH=/tmp/crane-final-deps:$PYTHONPATH; python3 /tmp/crane-nlc/mcp_smoke.py'
-```
-
-このテストの移動量は0.05 rad（約2.9度）なので見た目の変化は小さめです。各姿勢を2秒保持するには末尾を `mcp_smoke.py --hold 2` にします。ターミナルの `moving 関節名 -> 目標角度` と、結果の `positions`・`success` も確認してください。
-
-### 大きく見やすい動作
-
-指定フォルダで以下を実行すると、肩を約20度傾けて戻し、反対側へ約20度傾けて戻します。各移動は3秒、各姿勢を3秒保持します。LLMなしの視認用試験で、全関節がほぼ直立（±0.08 rad以内）のときに実行できます。
-
-```powershell
-uv run --with mcp==1.26.0 python visible_demo.py
-```
-
-この試験はLLMに選択させるジェスチャーツールには公開していません。LLMで大きめの動きを生成する場合は、次の実行確認済み指示を使えます。
-
-```powershell
-uv run --with mcp==1.26.0 python local_client.py --docker --execute --prompt 'Make a two-step plan: first tilt only the shoulder joint with a clearly visible large angular change from its starting pose, taking 4 seconds; second return the shoulder to its initial angle, taking 4 seconds.'
-```
-
-この試行ではLLMが0.30 rad（約17度）を選び、傾きと復帰の両方で到達を確認しました。必要なら以下でGazeboのカメラを近づけられます（ロボットの姿勢は変えません）。
-
-```powershell
-docker exec -u ubuntu pai_ros2 python3 /tmp/crane-nlc/focus_camera.py
-```
-
-Ollamaは[公式Windows配布](https://github.com/ollama/ollama/releases)の `ollama-windows-amd64.zip` を `.tmp/ollama` に展開します（`ollama.exe` が直下）。本PCではこの場所へ取得しています。システムへのインストール、APIキー、課金契約は不要です。
+Ollamaサーバーが停止している場合に実行する。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\start-local-llm.ps1
+```
+
+モデルの取得は初回のみ必要である。
+
+```powershell
 .\.tmp\ollama\ollama.exe pull qwen3:4b
-# 最初は計画表示のみ
-uv run --with mcp==1.26.0 python local_client.py --docker --prompt 'Move the shoulder and elbow joints slightly at the same time, then return both joints to their initial angles.'
-# MCPで実際に実行
-uv run --with mcp==1.26.0 python local_client.py --docker --execute --prompt 'Move the shoulder and elbow joints slightly at the same time, then return both joints to their initial angles.'
-# 会話形式。直前の計画を履歴として渡し、追加指示を入力できる
+```
+
+サーバーは `127.0.0.1:11434` で待ち受け、`OLLAMA_NO_CLOUD=1` を設定する。モデルの保存先は `.tmp/models` である。起動スクリプトは既存サーバーの有無を判定しないため、重複して実行しない。
+
+### 3. 自然言語による操作
+
+会話形式で起動する。
+
+```powershell
 uv run --with mcp==1.26.0 python local_client.py --docker --execute
 ```
 
-### 「元の姿勢」と前回動作の参照
+指示はPowerShellのプロンプトではなく、起動後の `instruction (exit to quit)>` に入力する。英語の指示を中心に検証している。
 
-元の姿勢は、その会話で最初の指示を受け付けた時点の関節角度として保存します。追加指示の開始時点の姿勢とは区別します。会話を終了して起動し直す場合、次のコマンドで `artifacts/runs.jsonl` から元の姿勢と前回の実行済み動作を復元できます。
-
-```powershell
-uv run --with mcp==1.26.0 python local_client.py --docker --execute --resume
-```
-
-`Resumed reference action:` に、再利用する前回の指示が表示されます。拒否・計画表示のみ・一部だけ完了・最大変位0.02 rad未満の記録は復元対象にしません。参照したい動作が表示されたことを確認して、`instruction ...>` に入力します。
-
-共通制約への変更前の動作は、指示外の動作が混じる可能性があるため再実行対象にしません。その場合は元姿勢の参照のみ復元した旨を表示します。新しく動作を指示し、成功した後に「同じ動作」を使ってください。過去ログは削除・書き換えしません。
+現在姿勢から手首だけを動かす例である。
 
 ```text
-Return to your original posture, then perform the same action in half the time.
+From your current posture, move only the wrist over 3 seconds. Keep all other joints still.
 ```
 
-LLMが再実行の条件を解釈し、照合に通った時間・振り幅の倍率と復帰の有無を固定します。以前の方式では、元姿勢への復帰後、同じ目標をアーム2.5秒・グリッパ1秒（元は5秒・2秒）で再実行した到達成功ログがあります。今回の共通制約への変更後は、再実行による移動は未確認です。表示だけで確認するには起動時の `--execute` を外します。
+アーム4関節を0 radに設定する例である。
 
-Ollamaはlocalhostに限定し、`OLLAMA_NO_CLOUD=1` を設定します。モデルは `.tmp/models`、指示解釈・照合・計画・実行記録は `artifacts/runs.jsonl`。これらはGit管理外です。新方式は複数回の推論を行うため、以前の単発計画より時間がかかります。英語を優先して試してください。日本語・自由な追加指示は安定性未確認です。
+```text
+Set the base, shoulder, elbow, and wrist joints to 0 radians over 4 seconds. Keep the gripper unchanged.
+```
 
-## 制御と制約
-
-- `/robot_description` のGazebo用URDFから可動範囲を取得。関節名で対応し、配列順には依存しません。
-- 現在はアーム目標を±0.4 rad、グリッパを±0.15 rad、1回の差分を0.4 rad以下、動作時間を1〜15秒に限定。URDF制限も併せて検査します。近い直立姿勢から肩を±0.35 rad動かす試験を実施しましたが、範囲内の全関節の組み合わせは未検証です。衝突回避の機能はありません。
-- アームとグリッパは別々の操作。省略した関節は指令直前の現在値を維持します。
-- 新しい関節状態5サンプルで、全指令関節の誤差が0.005 rad以内であることを確認。壁時計で `duration * 4 + 5` 秒を超えると失敗とし、後続操作を停止します。
-- 送信成功だけでは到達成功にしません。タイムアウトは緊急停止ではなく、送信済み軌道のキャンセルは未実装です。
-- 自己衝突・机との接触を検査する機能、逆運動学、画像認識、物体把持は実装しません。グリッパの開閉方向の視覚的な校正も未完了です。
-- クライアントは最大8ステップの計画全体を検査し、実行時にもROS側で各指令を検査します。同時に複数クライアントを実行しないでください。
-- 数値・構造の検査は、指示どおりの意味であることを保証しません。戻りの省略や「遅く」を速くする失敗もありました。まず計画表示で確認します。不正な計画は実行せず、最大2回までLLMへ修正を依頼して、その試行もログに残します。
-- アームとグリッパは生成用JSON Schemaでも別グループに限定します。ゼロ指定の関節も反対グループには含めません。再計画が3回とも拒否された場合、会話モードは理由を表示して次の入力へ戻ります。`--prompt` の単発実行は終了コード1を返します。
-- `offsets` は `reference` で選ぶ姿勢が基準です。`current` は今回の指示開始時、`original` は保存した元姿勢、`previous_step_1` などは前回計画の各ステップの姿勢です。ゼロは選択した基準姿勢への復帰を表します。根元の正回転は+Z軸方向で、上から見て反時計回りです。
-- LLM計画には現在姿勢から0.02 rad以上の変位を必要とします。検査を通すためだけの微小動作を避けるためです。再実行で時間・振り幅を変更しても、各目標の範囲、ステップ差分、1〜15秒、最大8ステップの検査を行います。
+単発の指示は `--prompt` で指定する。`--execute` を省略した場合は、関節状態の取得と計画表示までを行い、移動指令は送信しない。
 
 ```powershell
-uv run --with mcp==1.26.0 python -m unittest test_plans.py
-uv run --with mcp==1.26.0 python -m unittest test_client_recovery.py
-uv run --with mcp==1.26.0 python -m unittest test_instruction_contract.py
-# ローカルモデルの解釈・照合・計画を評価（MCP接続なし・ロボット移動なし）
-uv run --with mcp==1.26.0 python evaluate_contracts.py --plans
-# 実際のローカルLLMで英語3指示を会話履歴付きで評価（--executeで関節移動）
-uv run --with mcp==1.26.0 python evaluate_local.py --execute
+uv run --with mcp==1.26.0 python local_client.py --docker --prompt "From your current posture, move only the wrist over 3 seconds. Keep all other joints still."
 ```
 
-MCPはPython SDK 1.26.0のstdioを使います（講義Python 3.10を維持）。[公式SDK v1資料](https://py.sdk.modelcontextprotocol.io/v1/)、[Ollama Chat API](https://docs.ollama.com/api/chat)、[Qwen3 4Bモデル](https://ollama.com/library/qwen3:4b)。Qwen3 4Bには旧方式での追従失敗・思考モード応答未完了の記録もあります。現在は思考なし・解釈と計画の分離・共通制約の条件で再評価しています。
+### 4. 終了と再開
 
-## 開発の引継ぎ
+クライアントでは `exit` を入力する。PowerShellへ戻った後、コンテナを停止し、LLMのモデルをメモリから解放する。
 
-開発方針と既存教材の参照先は、ローカルの親フォルダにある `../HANDOFF.md` に記載しています（リポジトリ管理外）。
+```powershell
+docker stop pai_ros2
+.\.tmp\ollama\ollama.exe stop qwen3:4b
+```
 
-## 参考
+Ollamaサーバー自体を停止する場合は、起動した `.tmp/ollama/ollama.exe` のプロセスを終了する。Docker Desktopは通知領域のメニューからQuitを選んで終了する。
 
+再開時は起動手順を繰り返す。コンテナ再起動後のGazeboは新しい初期状態となるため、通常は `--resume` を付けずに開始する。
+
+`--resume` はローカルの実行ログから元姿勢と前回動作を復元するオプションである。元姿勢とは、その会話で最初の指示を受け付けた時点の関節角度を指す。拒否・未完了・プレビューの記録、および現在の契約バージョンで検証されていない動作は再実行対象としない。
+
+## 検証
+
+### 自動テスト
+
+関節の許可範囲、手順・時間の制約、絶対角度の保持、再実行条件、拒否時の指令抑止などを検査する。単体・結合テスト30件の成功を確認した。
+
+```powershell
+uv run --with mcp==1.26.0 python -m unittest test_instruction_contract test_plans test_client_recovery
+```
+
+### 関節制御の確認
+
+LLMを介さずに、MCP経由で状態取得のみを行う。
+
+```powershell
+uv run --with mcp==1.26.0 python mcp_smoke.py --docker --state-only
+```
+
+次のコマンドは、各関節を順に0.05 rad動かして元へ戻す試験である。
+
+```powershell
+uv run --with mcp==1.26.0 python mcp_smoke.py --docker --hold 2
+```
+
+### LLMを含む検証
+
+現在の実装で、次の自動実行をGazebo上で確認した。
+
+| 指示 | 結果 |
+| --- | --- |
+| 現在姿勢から手首だけを3秒で動かす | 0.150→目標0.200 radで到達成功。他4関節の変動は最大約1e-10 rad |
+| アーム4関節を4秒で0 radに設定する | 全4関節で到達成功。静止後の最大絶対角度は約1.18e-12 rad。グリッパーは約0.1 radで維持 |
+
+全関節・グリッパーの往復、タイムアウト時の停止もMCP経由で確認済みである。一方、複雑な追加指示や再実行の倍率変更は、現在の実装で十分な実行検証ができていない。
+
+指示の解釈・照合・計画生成だけを評価するスクリプトも用意した。以下はMCPへ接続せず、ロボットを動かさない。
+
+```powershell
+uv run --with mcp==1.26.0 python evaluate_contracts.py --plans
+```
+
+これは評価用コマンドであり、全ケースの成功を示すものではない。実モデルでは関節の取り違え、不要な復帰、正しい指示の過剰な拒否が発生している。
+
+## 制約と未対応事項
+
+| 項目 | 設定 |
+| --- | --- |
+| アームの目標角度 | ±0.4 rad以内 |
+| グリッパーの目標角度 | ±0.15 rad以内 |
+| 1操作あたりの関節角度差 | 0.4 rad以下 |
+| 動作時間 | 1〜15秒 |
+| 計画の最大ステップ数 | 8 |
+| 到達判定 | 新しい状態5サンプルで誤差0.005 rad以内 |
+| タイムアウト | 壁時計で `duration * 4 + 5` 秒 |
+
+上記のデモ用制限に加え、Gazebo用URDFの可動範囲も検査する。関節名で状態を対応づけ、配列順には依存しない。計画中に関節状態が0.01 radを超えて変化した場合は実行を中止する。
+
+アームとグリッパーは別々に操作し、省略した関節は指令直前の角度を維持する。両者の同時動作には対応していない。明示された全姿勢復帰はコントローラーごとに分割するが、合計時間の指定がある場合は自動分割せず停止する。
+
+相対移動では、現在姿勢から0.02 rad以上の変位を計画に必要とする。絶対角度の指定では、すでに目標にいる関節の保持を認める。「半分の時間」などの再実行で動作時間が1秒未満になる場合は、時間を自動変更せず停止する。
+
+逆運動学、画像認識、物体把持、障害物回避、自己衝突・机との接触検査は対象外である。許容範囲内の全姿勢について衝突しないことは検証していない。グリッパーの開閉方向の視覚的な校正も未完了である。タイムアウト時は後続操作を停止するが、送信済み軌道のキャンセルは未実装である。
+
+LLMによる解釈と照合が同じ誤りを起こす可能性は残る。構造・数値の検査は、自然言語の意味を完全に保証するものではない。また、複数回のローカル推論を行うため、指示の受付から実行開始までに時間を要する。日本語や自由な追加指示の安定性は未確認である。
+
+## ファイル構成
+
+| ファイル | 役割 |
+| --- | --- |
+| `local_client.py` | Ollamaへの問い合わせ、計画検査、MCP呼び出し |
+| `instruction_contract.py` | 操作範囲の定義、生成スキーマ、指示との整合性検査 |
+| `mcp_server.py` / `mcp_connection.py` | MCPツールとstdio接続 |
+| `crane_control.py` / `motion_policy.py` | ROS 2制御、到達確認、デモ用制限 |
+| `prepare.ps1` / `launch-gazebo.ps1` / `start-local-llm.ps1` | 実行環境の準備と起動 |
+| `mcp_smoke.py` / `verify_timeout.py` | 関節制御とタイムアウトの検証 |
+| `evaluate_contracts.py` / `evaluate_local.py` | LLMを含む評価 |
+| `test_*.py` | 単体・結合テスト |
+| `visible_demo.py` / `focus_camera.py` | 動作の視認用試験とカメラ調整 |
+
+モデル、実行ログ、生成物はGit管理外とする。モデルは `.tmp/models`、指示の解釈・計画・実行結果は `artifacts/` に保存する。
+
+## 参考資料
+
+- [MCP Python SDK](https://py.sdk.modelcontextprotocol.io/v1/)
+- [Ollama Chat API](https://docs.ollama.com/api/chat)
+- [Qwen3 4B](https://ollama.com/library/qwen3:4b)
 - [LLMとROS2で亀を動かす！（Qiita）](https://qiita.com/t13801206/items/f27b0f11aed92c1db890)
 - [ROS MCP Server](https://github.com/robotmcp/ros-mcp-server)
