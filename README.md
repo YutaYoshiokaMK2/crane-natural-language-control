@@ -4,6 +4,57 @@
 
 LLMは現在の関節状態を参照し、目標角度、動作時間、操作順序を計画する。実行側では指示の範囲と数値制限を検査し、MCP・ROS 2を介して関節を制御する。固定のジェスチャーを選択する方式ではなく、関節単位の計画生成を対象とする。
 
+## 必要環境
+
+Windows側でLLMとMCPクライアントを動かし、Dockerコンテナ内でROS 2・Gazebo・MCPサーバーを動かす構成である。以下は使用・確認した環境であり、すべての項目を同じバージョンへ固定しているわけではない。
+
+### ホスト側
+
+| 項目 | 使用・確認した環境 |
+| --- | --- |
+| OS・シェル | Windows / PowerShell |
+| コンテナ実行環境 | Docker Desktop（WSL 2バックエンド） |
+| Python実行環境 | `uv` 0.13.0、Python 3.14.6（uv管理） |
+| ローカル推論 | Ollama（検証時0.40.11） |
+| LLM | `qwen3:4b`、思考なし |
+
+Ollamaは[公式配布](https://github.com/ollama/ollama/releases)の `ollama-windows-amd64.zip` を `.tmp/ollama/` に展開する。実行ファイルの配置先は `.tmp/ollama/ollama.exe` である。
+
+検証に使用したPCはIntel Core Ultra 7 258V、メモリ32 GBである。GPU加速は未検証であり、この構成を最低ハードウェア要件とするものではない。
+
+### コンテナ側
+
+| 項目 | 使用環境 |
+| --- | --- |
+| コンテナ名 | `pai_ros2` |
+| Dockerイメージ | `airobotbook/ros2-desktop-ai-robot-book-humble:latest` |
+| ROS | ROS 2 Humble |
+| Python | 3.10.12 |
+| シミュレーター | 講義用コンテナに同梱されたGazebo |
+| ROSワークスペース | `/home/ubuntu/airobot_ws`（ビルド済み） |
+| DDS実装 | Cyclone DDS（`rmw_cyclonedds_cpp`） |
+
+ROS側では以下のパッケージを使用する。講義用ワークスペースとその依存パッケージが導入済みであることを前提とし、本リポジトリではROS環境を一から構築しない。
+
+| パッケージ | 用途 |
+| --- | --- |
+| `rclpy` | ROS 2のPythonクライアント |
+| `sensor_msgs` / `std_msgs` / `trajectory_msgs` | 関節状態、ロボット記述、軌道指令のメッセージ |
+| `rmw_cyclonedds_cpp` | ROS 2通信 |
+| `crane_plus_gazebo` | CRANE+ V2のシミュレーション起動 |
+| `joint_state_broadcaster` / `joint_trajectory_controller` | 関節状態の配信と軌道制御 |
+
+GazeboおよびROSパッケージの個別バージョンは固定していない。Dockerイメージも `latest` タグを使用しており、異なるイメージ版での互換性は未検証である。
+
+### Pythonパッケージ
+
+| パッケージ | バージョン・導入方法 |
+| --- | --- |
+| `mcp` | `1.26.0` に固定。`requirements.txt` と実行コマンドで指定 |
+| `jsonschema` | MCP SDKの依存として `4.20.0` 以上を導入。確認環境では `4.26.0`、個別固定なし |
+
+MCP SDK 1.26.0のPython要件は3.10以上である。ホスト側は `uv run --with mcp==1.26.0`、コンテナ側は `prepare.ps1` により追加パッケージを導入する。ROS用Pythonパッケージはコンテナの既存環境を利用する。
+
 ## システム構成
 
 ```text
@@ -46,19 +97,6 @@ LLMの出力をそのままROSへ送信せず、操作範囲と角度計画を�
 絶対角度の指定は `set_absolute` と `absolute_targets` に保持し、指定値を直接目標とする。例えば「0 radにする」という指示をLLMに相対移動量へ変換させない。相対移動は `offsets` で表し、指示開始時の関節角度を基準に絶対目標へ変換する。
 
 既定の動作は自動実行である。任意の `--confirm-plan` オプションを指定した場合に限り、計画表示後の確認入力を必要とする。
-
-## 実行環境
-
-検証環境はWindows、Docker Desktop（WSL 2）、ROS 2 Humble、Python 3.10の講義用コンテナである。コンテナ名は `pai_ros2`、イメージは `airobotbook/ros2-desktop-ai-robot-book-humble:latest` を使用した。推論はIntel Core Ultra 7 258V、メモリ32 GBのPC上で実行した。GPU加速は未検証である。
-
-実行には次の環境を前提とする。
-
-- Docker Desktopと講義用の `pai_ros2` コンテナ
-- コンテナ内の `/home/ubuntu/airobot_ws` とCRANE+用のGazebo環境
-- Windows側の `uv`
-- OllamaのWindows実行ファイルと `qwen3:4b` モデル
-
-Ollamaは[公式配布](https://github.com/ollama/ollama/releases)の `ollama-windows-amd64.zip` を `.tmp/ollama/` に展開する。`ollama.exe` の配置先は `.tmp/ollama/ollama.exe` である。
 
 ## 起動と操作
 
