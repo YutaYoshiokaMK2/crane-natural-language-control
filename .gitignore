@@ -20,6 +20,7 @@ install/
 log/
 
 # Generated artifacts and local caches
+/DEVELOPMENT.md
 .tmp/
 .cache/
 artifacts/
