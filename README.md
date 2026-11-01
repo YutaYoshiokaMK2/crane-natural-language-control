@@ -144,16 +144,16 @@ uv run --with mcp==1.26.0 python local_client.py --docker --execute
 
 指示はPowerShellのプロンプトではなく，起動後の `instruction (exit to quit)>` に入力する．英語の指示を中心に検証している．
 
-現在姿勢から手首だけを動かす例
+肩関節だけを大きく曲げる例
 
 ```text
-From your current posture, move only the wrist over 3 seconds. Keep all other joints still.
+Please bend only the shoulder joint significantly. Ensure the arm tilts noticeably—do not just make a small movement. Do not change the angles of any other joints.
 ```
 
-複数関節の同時動作の例（計画生成のみ確認，Gazeboでの実行は未確認）
+肩の姿勢を保ち，ベース関節と肘関節を同時に大きく動かす例
 
 ```text
-Move only the base and elbow joints simultaneously. Keep the shoulder, wrist and gripper joint angles unchanged. Make both movements clearly visible.
+Please move only the base joint and the elbow joint significantly and simultaneously. Ensure that the movements are substantial enough to result in a clearly noticeable change in posture, rather than just small adjustments. Do not alter the angles of the shoulder joint, the wrist joint, or the gripper.
 ```
 
 アーム4関節を0 radに設定する例
@@ -213,6 +213,8 @@ Gazebo上での自動実行の確認結果
 
 | 指示 | 結果 |
 | --- | --- |
+| 数値を指定せず，肩関節だけを大きく曲げる | LLMが約0.30 rad，2秒を選択し，到達成功．他4関節を維持 |
+| 続けてベースと肘を同時に大きく動かす | LLMが両関節とも約0.30 rad，2秒を選択し，1ステップで到達成功．肩を約0.30 radに保ち，手首・グリッパーも維持 |
 | 現在姿勢から手首だけを3秒で動かす | 0.150→目標0.200 radで到達成功．他4関節の変動は最大約1e-10 rad |
 | アーム4関節を4秒で0 radに設定する | 全4関節で到達成功．静止後の最大絶対角度は約1.18e-12 rad．グリッパーは約0.1 radで維持 |
 
@@ -246,7 +248,7 @@ uv run --with mcp==1.26.0 python evaluate_contracts.py --plans
 
 逆運動学，画像認識，物体把持，障害物回避，自己衝突・机との接触検査は対象外である．許容範囲内の全姿勢について衝突しないことは検証していない．グリッパーの開閉方向の視覚的な校正も未完了である．タイムアウト時は後続操作を停止するが，送信済み軌道のキャンセルは未実装である．
 
-LLMによる解釈と照合が同じ誤りを起こす可能性は残る．構造・数値の検査は，自然言語の意味を完全に保証するものではない．また，複数回のローカル推論を行うため，指示の受付から実行開始までに時間を要する．日本語や自由な追加指示の安定性は未確認である．
+LLMによる解釈と照合が同じ誤りを起こす可能性は残る．構造・数値の検査は，自然言語の意味を完全に保証するものではない．「目で分かる程度」という指示で0.05 radの小さな移動が選ばれた例もあり，定性的な大小の指定が常に同じ角度になるわけではない．また，複数回のローカル推論を行うため，指示の受付から実行開始までに時間を要する．日本語や自由な追加指示の安定性は未確認である．
 
 ## ファイル構成
 
