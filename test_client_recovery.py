@@ -15,6 +15,42 @@ from motion_policy import ARM, HAND, DEMO_LIMITS, MAX_STEP
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_interpreter_uses_source_quote_enum_without_generating_another_reason(self):
+        instruction = 'Rotate the base while bending the elbow. Keep the shoulder still.'
+        raw = {'operation': 'new_action', 'stages': [{'joints': ['base', 'elbow'], 'kind': 'move',
+               'absolute_targets': {}, 'evidence': instruction, 'duration_seconds': None}], 'repeat': None}
+        response = {'done': True, 'message': {'content': json.dumps(raw)}}
+        with patch.object(local_client, 'route_instruction', return_value={'operation': 'new_action', 'reason': 'new motion'}), \
+             patch.object(local_client.urllib.request, 'urlopen', return_value=io.StringIO(json.dumps(response))) as request:
+            contract = local_client.classify_instruction('http://127.0.0.1:11434', 'qwen3:4b', instruction)
+        payload = json.loads(request.call_args.args[0].data)
+        offered = payload['format']['properties']['stages']['items']['properties']['evidence']['enum']
+        self.assertTrue(all(quote in instruction for quote in offered))
+        self.assertNotIn('reason', payload['format']['properties'])
+        self.assertEqual(contract['reason'], 'new motion')
+        self.assertEqual(contract['stages'][0]['joints'], [ARM[0], ARM[2]])
+
+    def test_auditor_returns_only_a_decision_and_keeps_rejection(self):
+        contract = {'operation': 'new_action', 'reason': 'base', 'stages': [
+            {'joints': [ARM[0]], 'kind': 'move', 'evidence': 'Move base', 'duration_seconds': None}], 'repeat': None}
+        keys = ['moving_joints_match', 'held_joints_match', 'sequence_matches', 'references_match', 'parameters_match']
+        for failure in [None] + keys:
+            checks = {key: key != failure for key in keys}
+            response = {'done': True, 'message': {'content': json.dumps(checks)}}
+            with self.subTest(failure=failure), \
+                 patch.object(local_client.urllib.request, 'urlopen', return_value=io.StringIO(json.dumps(response))) as request:
+                audit = local_client.audit_instruction('http://127.0.0.1:11434', 'qwen3:4b', 'Move base', contract)
+            self.assertIs(audit['accepted'], failure is None)
+            if failure:
+                self.assertIn(failure, audit['reason'])
+            payload = json.loads(request.call_args.args[0].data)
+            self.assertEqual(payload['format']['required'], keys)
+            shown = json.loads(payload['messages'][1]['content'])['contract']['stages'][0]
+            self.assertEqual(shown['moving_joints'], ['base'])
+            self.assertEqual(shown['held_joints'], ['shoulder', 'elbow', 'wrist', 'gripper'])
+            self.assertNotIn('evidence', shown)
+            self.assertNotIn('reason', json.loads(payload['messages'][1]['content'])['contract'])
+
     def test_speed_only_repeat_cannot_change_amplitude(self):
         request = {'explanation': 'faster repeat', 'repeat_previous': {
             'return_to_original': True, 'time_scale': 0.5, 'amplitude_scale': 0.5,
@@ -100,14 +136,15 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         good_shape_bad_meaning = {'operation': 'new_action', 'reason': 'wrong interpretation', 'repeat': None,
             'stages': [{'joints': [ARM[0]], 'kind': 'move', 'evidence': 'Move wrist; keep base still', 'duration_seconds': None}]}
         ambiguous = {'operation': 'clarify', 'reason': 'which joint?', 'stages': [], 'repeat': None}
-        for contract in [good_shape_bad_meaning, ambiguous, None]:
+        for contract in [good_shape_bad_meaning, ambiguous, None, TimeoutError('timed out')]:
             calls.clear()
             with self.subTest(contract=contract), tempfile.TemporaryDirectory() as directory:
                 args = Namespace(url='http://127.0.0.1:11434', model='qwen2.5:3b', docker=False,
                     prompt='Move wrist; keep base still', think=False, execute=True, log=Path(directory) / 'runs.jsonl')
                 with patch.object(local_client, 'stdio_client', transport), \
                      patch.object(local_client, 'ClientSession', lambda *args: Session()), \
-                     patch.object(local_client, 'classify_instruction', return_value=contract) as interpret, \
+                     patch.object(local_client, 'classify_instruction', return_value=contract,
+                                  side_effect=contract if isinstance(contract, Exception) else None) as interpret, \
                      patch.object(local_client, 'audit_instruction', return_value={'accepted': False, 'reason': 'Extra base movement'}) as audit, \
                      patch.object(local_client, 'plan_request') as planner, redirect_stdout(io.StringIO()):
                     result = await local_client.main(args)
@@ -115,7 +152,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(calls, ['get_joint_state'])
                 interpret.assert_called_once()
                 planner.assert_not_called()
-                self.assertEqual(audit.call_count, int(contract is not None and contract['operation'] != 'clarify'))
+                self.assertEqual(audit.call_count, int(isinstance(contract, dict) and contract['operation'] != 'clarify'))
                 records = [json.loads(line) for line in args.log.read_text(encoding='utf-8').splitlines()]
                 self.assertEqual(len(records), 1)
                 self.assertFalse(records[0]['executed'])

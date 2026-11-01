@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import urllib.request
+import urllib.error
 from urllib.parse import urlparse
 
 from mcp import ClientSession
@@ -15,9 +16,9 @@ from mcp_smoke import unpack
 from mcp_connection import server_parameters
 from motion_policy import ARM, HAND, DEMO_LIMITS, MAX_STEP
 from instruction_contract import (CONTRACT_SCHEMA, INTERPRETER_SCHEMA, JOINT_NAMES, readable_contract,
-    INTERPRETER_SYSTEM, AUDITOR_SYSTEM, AUDIT_SCHEMA,
+    INTERPRETER_SYSTEM, AUDITOR_SYSTEM, AUDIT_SCHEMA, AUDIT_CHECKS,
     InstructionRejected, validate_contract, constrained_schema, validate_plan_contract, validate_resolved_contract,
-    planning_stages, source_candidates, contract_summary)
+    planning_stages, source_candidates, evidence_candidates, contract_summary)
 
 SYSTEM = '''Plan small CRANE+ robot motions. Choose joint target angles, durations and step order.
 For "repeat" or "same action", DO NOT rewrite the old steps. Return ONLY this JSON instead:
@@ -119,6 +120,11 @@ def classify_instruction(url, model, instruction):
     if route['operation'] in ('clarify', 'unsupported'):
         return {**route, 'stages': [], 'repeat': None}
     schema = copy.deepcopy(INTERPRETER_SCHEMA)
+    # The router already provides a reason. Generate permissions here, not another narrative.
+    schema['properties'].pop('reason')
+    schema['required'].remove('reason')
+    schema['properties']['stages']['items']['properties']['evidence'] = {
+        'type': 'string', 'enum': evidence_candidates(instruction)}
     candidates, _ = source_candidates(instruction)
     names = [name for name, joint in JOINT_NAMES.items() if joint in candidates]
     if names:
@@ -145,6 +151,7 @@ def classify_instruction(url, model, instruction):
     intent = json.loads(result['message']['content'])
     from jsonschema import validate
     validate(intent, payload['format'])
+    intent['reason'] = route['reason']
     for stage in intent['stages']:
         stage['joints'] = [JOINT_NAMES[name] for name in stage['joints']]
         if 'absolute_targets' in stage:
@@ -153,9 +160,18 @@ def classify_instruction(url, model, instruction):
 
 
 def audit_instruction(url, model, instruction, contract):
+    readable = readable_contract(contract)
+    readable.pop('reason', None)
+    if contract['operation'] == 'new_action':
+        # Compare the instruction to execution semantics, without the first model's narrative or quotes.
+        for stage in readable['stages']:
+            moving = stage.pop('joints')
+            stage.pop('evidence', None)
+            stage['moving_joints'] = moving
+            stage['held_joints'] = [name for name in JOINT_NAMES if name not in moving]
     payload = {'model': model, 'stream': False, 'messages': [
         {'role': 'system', 'content': AUDITOR_SYSTEM},
-        {'role': 'user', 'content': json.dumps({'instruction': instruction, 'contract': readable_contract(contract)}, ensure_ascii=False)}],
+        {'role': 'user', 'content': json.dumps({'instruction': instruction, 'contract': readable}, ensure_ascii=False)}],
         'format': AUDIT_SCHEMA, 'options': {'temperature': 0, 'num_predict': 256, 'num_ctx': 4096}}
     if model.startswith('qwen3'):
         payload['think'] = False
@@ -167,6 +183,10 @@ def audit_instruction(url, model, instruction, contract):
     audit = json.loads(result['message']['content'])
     from jsonschema import validate
     validate(audit, AUDIT_SCHEMA)
+    failures = [key for key in AUDIT_CHECKS if not audit[key]]
+    audit['accepted'] = not failures
+    audit['reason'] = ('Instruction audit accepted the extracted permissions.' if audit['accepted']
+                       else 'Instruction audit found a mismatch or ambiguity: ' + ', '.join(failures))
     return audit
 
 
@@ -456,6 +476,8 @@ async def main(args):
                                       and intent['operation'] == 'new_action')
                         break
                     except Exception as exc:
+                        if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+                            exc = InstructionRejected('Local LLM request failed or timed out: ' + str(exc))
                         with args.log.open('a', encoding='utf-8') as handle:
                             handle.write(json.dumps({'time': datetime.now(timezone.utc).isoformat(),
                                 'instruction': prompt, 'intent': intent, 'audit': audit, 'state': state, 'original_pose': original_pose,

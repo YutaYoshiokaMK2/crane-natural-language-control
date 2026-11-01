@@ -3,7 +3,7 @@ import copy
 import unittest
 from jsonschema import ValidationError
 from instruction_contract import (validate_contract, validate_plan_contract, validate_resolved_contract,
-                                  planning_stages, source_candidates, InstructionRejected)
+                                  planning_stages, source_candidates, evidence_candidates, InstructionRejected)
 from local_client import JOINT_SCHEMA, REPEAT_SCHEMA, absolute_plan, validate_plan
 from motion_policy import ARM, HAND
 
@@ -19,6 +19,28 @@ def step(joints, stage=1, reference='current', duration=3, offset=0.1):
 
 
 class InstructionContractTests(unittest.TestCase):
+    def test_demo_evidence_is_verbatim_and_spliced_quote_still_rejected(self):
+        text = ('Maintain the current degree of bend in the shoulder, and while rotating the base joint, '
+                'simultaneously bend the elbow joint. Ensure that the movement in both joints is clearly visible. '
+                'Do not move the wrist or the gripper.')
+        candidates = evidence_candidates(text)
+        self.assertTrue(all(candidate in text for candidate in candidates))
+        first_sentence = text.split('. ')[0] + '.'
+        self.assertIn(first_sentence, candidates)
+        contract = contract_for([ARM[0], ARM[2]], evidence=first_sentence)
+        validate_contract(contract, text)
+        contract['stages'][0]['evidence'] = 'rotating the base joint, bend the elbow joint'
+        with self.assertRaises(InstructionRejected):
+            validate_contract(contract, text)
+
+    def test_evidence_preserves_numeric_values_and_negation(self):
+        text = 'Set base to -0.15 radians. Do not move shoulder.'
+        candidates = evidence_candidates(text)
+        self.assertIn('Set base to -0.15 radians.', candidates)
+        self.assertIn('Do not move shoulder.', candidates)
+        self.assertNotIn('move shoulder', candidates)
+        self.assertEqual(evidence_candidates('肘を動かす．肩は動かさない．'), ['肘を動かす．肩は動かさない．'])
+
     def test_absolute_angles_resolve_sign_in_python_and_accept_already_reached_joints(self):
         state = {'positions': dict(zip(ARM + [HAND], [-0.29, -0.31, 0, 0, 0.1])),
                  'limits': {j: {'lower': -1, 'upper': 1} for j in ARM + [HAND]}}

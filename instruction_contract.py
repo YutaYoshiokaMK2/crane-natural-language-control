@@ -33,6 +33,18 @@ def references_previous(text):
     return bool(re.search(r'\b(repeat|same|again|previous)\b|同じ|もう一度|前回|さっき|繰り返', text.lower()))
 
 
+def evidence_candidates(instruction):
+    """Offer verbatim sentence spans rather than letting the model splice quotes.
+
+    Keep the whole instruction as a fallback for cross-sentence references.
+    Punctuation is preserved, and decimal points do not split a sentence.
+    """
+    candidates = [instruction]
+    sentences = re.split(r'(?<=[.!?。．！？])\s+', instruction)
+    candidates.extend(sentence.strip() for sentence in sentences if sentence.strip())
+    return list(dict.fromkeys(candidates))
+
+
 def source_candidates(text):
     """Upper bound only: mentioned keep-still joints still need semantic review."""
     joints = mentioned_joints(text)
@@ -94,6 +106,7 @@ new_action: stages in requested order, one stage per requested motion. Simultane
 one stage; sequential motions use separate stages. Each stage's joints are exactly those to move.
 Each evidence is an EXACT verbatim substring of the instruction supporting that stage, including its action.
 Copy the words exactly, including articles such as "the"; do not paraphrase evidence.
+Select evidence from the supplied schema's enum. Never combine or shorten the offered quotations.
 kind move: from the measured current pose (default). return_start: ONLY explicitly asked to return to
 this request's starting pose. restore_original: ONLY explicitly asked to return to saved original/initial posture.
 kind set_absolute: an explicit absolute angle, e.g. "Set base and shoulder to 0 radians".
@@ -110,7 +123,7 @@ For new_action repeat=null. Never carry over changes from an earlier instruction
 If joints, ordering, or timing cannot be determined without inventing actions, use clarify, stages=[], repeat=null.
 For vision, grasping, IK or obstacle avoidance use unsupported. Simultaneous arm AND hand is unsupported
 (separate controllers currently execute sequentially). Do not silently serialize a simultaneous request.
-Output only the contract JSON. reason briefly describes the interpretation or the missing information.'''
+Output only the contract JSON. Do not generate an explanation or repeat the routing reason.'''
 
 AUDITOR_SYSTEM = '''Independently compare a robot instruction with an extracted permission contract.
 Do not plan robot motions. Reject any extra/missing joint, invented setup or restoration, invented return,
@@ -119,6 +132,11 @@ Joint names in the contract are base, shoulder, elbow, wrist, gripper. Hand mean
 An explicit "set ... to X radians" MUST use set_absolute and absolute_targets=X for the named joints.
 Reject move stages that discard an explicit absolute target, even if the reason mentions the right number.
 Keep-still joints must NEVER appear in moving joints. Other joints stay still unless explicitly requested.
+Only stage.moving_joints change angles. stage.held_joints hold their current angles during that stage.
+Holding a joint does not mean it belongs in moving_joints. The original extraction was checked separately;
+review only the concrete moving/held sets against the instruction.
+move stages let the later planner choose angles for qualitative requests such as large/clearly visible;
+do not reject a qualitative request merely because its numeric angle or unspecified duration is not chosen yet.
 Defaults: current posture, no return, no repeat, no time/amplitude change. A single motion must not become a cycle.
 Whole original posture restoration includes all four arm joints and the gripper in one logical stage;
 the backend splits its execution across controllers. This grouping is correct for a restoration.
@@ -127,15 +145,23 @@ do not reject them for being separate. Simultaneous shoulder and elbow share one
 For repeat_previous, stages MUST be empty: the backend reuses the previous action's stored steps.
 "same action" and "previous action" refer to the last action. Do not demand its full steps in the contract.
 The backend separately checks that a previous action exists. Review only the requested repeat parameters.
-The evidence must support the action, not merely mention a joint. Reject ambiguous contracts.
-Return {"accepted":true,"reason":"..."} only if the contract faithfully represents the instruction.
+Compare the action requested for each joint, not merely whether its name is mentioned. Reject ambiguous contracts.
+Return ONLY five boolean checks, no explanation:
+moving_joints_match: the stages move exactly the joints the instruction asks to move.
+held_joints_match: held_joints implements the instruction's unchanged joints.
+sequence_matches: stages match the requested order and simultaneous grouping.
+references_match: current/start/original and repeat/restore choices match the instruction.
+parameters_match: explicitly specified numeric targets, times and repeat scales match; unspecified values
+may remain unchosen for later planning. Qualitative large/visible requests are passed to the planner.
+Set a check to false for a mismatch or ambiguity. Do not require a moving joint to also appear in held_joints.
 For clarify/unsupported, accept only if the instruction truly needs clarification or unsupported capabilities.
 Simultaneous arm AND gripper movement is NOT supported by this backend (sequential controllers only).
 Never approve an unsupported request by claiming the backend has capabilities not stated here.
 This is an independent review: the contract may be wrong; do not trust its reason.'''
 
-AUDIT_SCHEMA = {'type': 'object', 'properties': {'accepted': {'type': 'boolean'},
-    'reason': {'type': 'string'}}, 'required': ['accepted', 'reason'], 'additionalProperties': False}
+AUDIT_CHECKS = ('moving_joints_match', 'held_joints_match', 'sequence_matches', 'references_match', 'parameters_match')
+AUDIT_SCHEMA = {'type': 'object', 'properties': {key: {'type': 'boolean'} for key in AUDIT_CHECKS},
+                'required': list(AUDIT_CHECKS), 'additionalProperties': False}
 
 class InstructionRejected(ValueError):
     """Do not retry motion planning by broadening instruction permissions."""

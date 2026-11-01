@@ -87,12 +87,12 @@ MCPサーバーの公開ツールは以下の3種類．
 LLMの出力をそのままROSへ送信せず，操作範囲と角度計画を分けて扱う．
 
 1. 対象関節，手順，指定時間，復帰・再実行の有無の抽出
-2. 別の推論による原文と抽出結果の照合
+2. 別の推論による対象関節・保持関節・順序と同時性・基準姿勢・指定パラメータの照合
 3. 操作範囲の固定と，その範囲内での角度・未指定時間の計画
 4. 計画全体の検査と，実行直前の関節状態の再取得
 5. MCPツールの順次呼び出しと各操作の到達確認
 
-操作範囲はJSON SchemaとPython側の検証で制約する．関節や手順の追加・欠落，順序の変更，指定時間の変更を検出した場合は実行しない．解釈・照合に失敗した場合も停止する．角度計画は初回を含めて最大3回試行し，その間も操作範囲は変更しない．
+操作範囲はJSON SchemaとPython側の検証で制約する．各手順の根拠となる引用文は，原文から切り出した候補に限定する．離れた箇所の継ぎ合わせや言い換えを防ぎ，引用が原文の一部と完全一致することを検査する．関節や手順の追加・欠落，順序の変更，指定時間の変更を検出した場合は実行しない．解釈・照合に失敗した場合も停止する．角度計画は初回を含めて最大3回試行し，その間も操作範囲は変更しない．
 
 絶対角度の指定は `set_absolute` と `absolute_targets` に保持し，指定値を直接目標とする．例えば「0 radにする」という指示をLLMに相対移動量へ変換させない．相対移動は `offsets` で表し，指示開始時の関節角度を基準に絶対目標へ変換する．
 
@@ -150,6 +150,12 @@ uv run --with mcp==1.26.0 python local_client.py --docker --execute
 From your current posture, move only the wrist over 3 seconds. Keep all other joints still.
 ```
 
+複数関節の同時動作の例（計画生成のみ確認，Gazeboでの実行は未確認）
+
+```text
+Move only the base and elbow joints simultaneously. Keep the shoulder, wrist and gripper joint angles unchanged. Make both movements clearly visible.
+```
+
 アーム4関節を0 radに設定する例
 
 ```text
@@ -181,7 +187,7 @@ Ollamaサーバー自体を停止する場合は，起動した `.tmp/ollama/oll
 
 ### 自動テスト
 
-関節の許可範囲，手順・時間の制約，絶対角度の保持，再実行条件，拒否時の指令抑止などを検査する．単体・結合テスト30件の成功を確認した．
+関節の許可範囲，手順・時間の制約，絶対角度の保持，再実行条件，拒否時の指令抑止などを検査する．単体・結合テスト34件の成功を確認した．
 
 ```powershell
 uv run --with mcp==1.26.0 python -m unittest test_instruction_contract test_plans test_client_recovery
